@@ -2,7 +2,7 @@
 
 ## WireGuard
 
-wget https://gist.githubusercontent.com/virtual-world-0923/a8967d3c82f40e9c2699d428728d363d/raw/11dcb299c582f99852be07fd3eadd1d70f554bea/install-WireGuard.sh
+wget https://gist.githubusercontent.com/virtual-world-0923/a8967d3c82f40e9c2699d428728d363d/raw/41ef9962f783810b89a9d48dece426e0da3d424f/install-WireGuard.sh
 
 
 
