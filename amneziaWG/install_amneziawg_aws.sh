@@ -851,6 +851,9 @@ install_main() {
     echo
     echo "[IMPORTANT] 请确认 AWS Security Group 已放行：UDP ${WG_PORT}"
     echo
+	
+	add_client client2
+	echo "已添加客户端2"
 }
 
 ###############################################################################
