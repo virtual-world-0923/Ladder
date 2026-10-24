@@ -10,9 +10,17 @@ set -Eeuo pipefail
 #   AWS EC2
 #   amd64
 #
-# Components:
-#   amneziawg-dkms
-#   amneziawg-tools
+# Backend (tried in this order, first success wins):
+#   1) kernel module via PPA     : amneziawg-dkms (apt + DKMS)
+#   2) kernel module from source : official amneziawg-linux-kernel-module repo
+#   3) userspace                 : amneziawg-go (no kernel module needed)
+#
+# Tools (awg / awg-quick): PPA package first, then build from source.
+#
+# Force a backend:
+#   sudo AWG_BACKEND=kernel    bash install_amneziawg_aws.sh   # 1 -> 2 only
+#   sudo AWG_BACKEND=userspace bash install_amneziawg_aws.sh   # 3 only
+#   (default: AWG_BACKEND=auto, i.e. 1 -> 2 -> 3)
 #
 # Network:
 #   Interface: awg0
@@ -60,7 +68,41 @@ H2="377281354"
 H3="1565363863"
 H4="244732598"
 
-BUILD_DIR=""
+# Backend selection: auto | kernel | userspace
+AWG_BACKEND="${AWG_BACKEND:-auto}"
+
+# Actually used backend (filled in by select_backend): kernel | userspace
+BACKEND=""
+BACKEND_DESC=""
+
+AWG_GO_REPO="https://github.com/amnezia-vpn/amneziawg-go.git"
+AWG_GO_REF="${AWG_GO_REF:-}"          # empty = default branch
+AWG_GO_BIN="/usr/local/bin/amneziawg-go"
+GO_FALLBACK_VERSION="go1.25.0"        # used only if go.dev version lookup fails
+
+AWG_KMOD_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+AWG_KMOD_REF="${AWG_KMOD_REF:-}"      # empty = default branch
+
+WORK_DIR=""
+TEMP_SWAP=""
+TOOLS_REF_USED=""
+
+BASE_PACKAGES=(
+    ca-certificates
+    curl
+    wget
+    git
+    build-essential
+    dkms
+    iproute2
+    iptables
+    qrencode
+    software-properties-common
+    python3-launchpadlib
+)
+
+# Dependency install summary (filled in while installing, printed at the end)
+SUMMARY=()
 
 ###############################################################################
 # Common functions
@@ -76,16 +118,58 @@ warn() {
     echo "[WARN] $*" >&2
 }
 
+summary_add() {
+    SUMMARY+=("$1：$2")
+}
+
+print_install_summary() {
+    local title="${1:-依赖安装总结}"
+
+    if [[ "${#SUMMARY[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    local line
+
+    echo
+    echo "============================================================"
+    echo " ${title}"
+    echo "============================================================"
+
+    for line in "${SUMMARY[@]}"; do
+        echo "  - ${line}"
+    done
+
+    echo "============================================================"
+}
+
 die() {
     echo
     echo "[ERROR] $*" >&2
+    print_install_summary "依赖安装状态（安装未完成）" >&2 || true
     exit 1
 }
 
 cleanup() {
-    if [[ -n "${BUILD_DIR}" && -d "${BUILD_DIR}" ]]; then
-        rm -rf "${BUILD_DIR}"
+    if [[ -n "${TEMP_SWAP}" && -f "${TEMP_SWAP}" ]]; then
+        swapoff "${TEMP_SWAP}" >/dev/null 2>&1 || true
+        rm -f "${TEMP_SWAP}" || true
     fi
+
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+        rm -rf "${WORK_DIR}"
+    fi
+}
+
+init_workdir() {
+    if [[ -z "${WORK_DIR}" || ! -d "${WORK_DIR}" ]]; then
+        WORK_DIR="$(mktemp -d /tmp/amneziawg-build.XXXXXX)"
+    fi
+}
+
+# version_ge A B  ->  true if A >= B (dotted versions)
+version_ge() {
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n '1p')" == "$2" ]]
 }
 
 trap cleanup EXIT
@@ -135,46 +219,119 @@ check_os() {
 ###############################################################################
 
 install_dependencies() {
-    log "安装依赖"
+    log "安装基础依赖"
 
     apt-get update
 
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        ca-certificates \
-        curl \
-        wget \
-        git \
-        build-essential \
-        dkms \
-        iproute2 \
-        iptables \
-        qrencode \
-        software-properties-common \
-        python3-launchpadlib \
-        "linux-headers-$(uname -r)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${BASE_PACKAGES[@]}"
+
+    summary_add "基础依赖 安装方式" "apt（${BASE_PACKAGES[*]}）"
 }
 
 ###############################################################################
-# AmneziaWG kernel module
+# Backend 1/2: kernel module (1: PPA + DKMS, 2: build from source)
+#
+# NOTE: these functions are called inside `if`, where `set -e` is disabled,
+#       so every step must explicitly `|| return 1`.
 ###############################################################################
 
-install_dkms() {
-    log "安装 AmneziaWG DKMS"
+cleanup_failed_kernel_install() {
+    warn "清理失败的内核模块安装残留"
 
-    add-apt-repository -y ppa:amnezia/ppa
+    local mod
 
-    apt-get update
+    while read -r mod; do
+        [[ -n "${mod}" ]] || continue
+        dkms remove "${mod}" --all >/dev/null 2>&1 || true
+    done < <(dkms status 2>/dev/null | sed -nE 's/^(amneziawg\/[^,:]+).*/\1/p' | sort -u)
+
+    dpkg --remove --force-remove-reinstreq \
+        amneziawg amneziawg-dkms amneziawg-tools >/dev/null 2>&1 || true
+
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+        amneziawg amneziawg-dkms amneziawg-tools >/dev/null 2>&1 || true
+
+    DEBIAN_FRONTEND=noninteractive apt-get -f install -y >/dev/null 2>&1 || true
+
+    dpkg --configure -a >/dev/null 2>&1 || true
+
+    rmmod amneziawg 2>/dev/null || true
+}
+
+# Both kernel-module methods need the headers of the running kernel.
+ensure_kernel_headers() {
+    local kdir="/lib/modules/$(uname -r)/build"
+
+    if [[ -d "${kdir}" ]]; then
+        summary_add "内核 headers" "已存在，无需安装（$(uname -r)）"
+        return 0
+    fi
 
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        amneziawg-dkms
+        "linux-headers-$(uname -r)" || {
+        warn "无法安装当前内核的 headers：linux-headers-$(uname -r)"
+        summary_add "内核 headers" "apt 安装失败（linux-headers-$(uname -r)）"
+        return 1
+    }
 
-    log "加载 amneziawg 内核模块"
+    [[ -d "${kdir}" ]] || {
+        warn "headers 已安装但找不到 ${kdir}"
+        summary_add "内核 headers" "已安装但找不到 ${kdir}"
+        return 1
+    }
 
-    modprobe amneziawg
+    summary_add "内核 headers 安装方式" "apt（linux-headers-$(uname -r)）"
 
-    if ! lsmod | grep -q '^amneziawg'; then
-        die "amneziawg 内核模块加载失败"
+    return 0
+}
+
+# Method 1: PPA package (amneziawg-dkms)
+try_kernel_ppa() {
+    log "方式 1：PPA 内核模块 (amneziawg-dkms)"
+
+    add-apt-repository -y ppa:amnezia/ppa || {
+        warn "添加 ppa:amnezia/ppa 失败"
+        summary_add "Amnezia PPA" "添加失败"
+        summary_add "内核模块 方式 1（PPA + DKMS）" "失败（PPA 不可用）"
+        return 1
+    }
+
+    if ! apt-get update; then
+        warn "apt-get update 失败（PPA 可能不支持当前 Ubuntu 版本），移除该 PPA"
+        add-apt-repository -y -r ppa:amnezia/ppa >/dev/null 2>&1 || true
+        summary_add "Amnezia PPA" "不支持当前系统，已移除"
+        summary_add "内核模块 方式 1（PPA + DKMS）" "失败（PPA 不可用）"
+        return 1
     fi
+
+    summary_add "Amnezia PPA" "已添加（ppa:amnezia/ppa）"
+
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y amneziawg-dkms; then
+        warn "amneziawg-dkms 安装/编译失败（内核 $(uname -r) 可能暂不受支持）"
+
+        local logf
+        for logf in /var/lib/dkms/amneziawg/*/build/make.log; do
+            if [[ -f "${logf}" ]]; then
+                echo
+                echo "---- ${logf}（末尾 30 行）----"
+                tail -n 30 "${logf}" || true
+                echo "------------------------------"
+            fi
+        done
+
+        cleanup_failed_kernel_install
+        summary_add "内核模块 方式 1（PPA + DKMS）" "失败（DKMS 编译错误，已清理）"
+        return 1
+    fi
+
+    if ! modprobe amneziawg || [[ ! -d /sys/module/amneziawg ]]; then
+        warn "amneziawg 内核模块已安装但无法加载"
+        cleanup_failed_kernel_install
+        summary_add "内核模块 方式 1（PPA + DKMS）" "失败（模块无法加载，已清理）"
+        return 1
+    fi
+
+    summary_add "内核模块 方式 1（PPA + DKMS）" "成功（amneziawg-dkms，内核升级后自动重编译）"
 
     echo
     echo "DKMS:"
@@ -183,40 +340,445 @@ install_dkms() {
     echo
     echo "Module:"
     modinfo amneziawg || true
+
+    return 0
+}
+
+# Linux 7.0 changed setup_udp_tunnel_sock() to take `struct sock *`, while the
+# module's compat.h still converts the argument to `struct socket *`.
+# Restrict that conversion macro to kernels older than 7.0.
+patch_kmod_compat() {
+    local build_dir="$1"
+    local compat_h="${build_dir}/compat/compat.h"
+    local pattern='^[[:space:]]*#[[:space:]]*define[[:space:]]+setup_udp_tunnel_sock\(net, sk, sock_cfg\)[[:space:]]+setup_udp_tunnel_sock\(net, sk->sk_socket, sock_cfg\)'
+
+    [[ -f "${compat_h}" ]] || return 1
+
+    if [[ "$(grep -cE "${pattern}" "${compat_h}" || true)" != "1" ]]; then
+        warn "compat.h 中没有找到预期的 setup_udp_tunnel_sock 宏，无法自动打补丁"
+        return 1
+    fi
+
+    sed -i -E "/${pattern}/{
+i\\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+a\\
+#endif
+}" "${compat_h}" || return 1
+
+    grep -q 'KERNEL_VERSION(7, 0, 0)' "${compat_h}" || return 1
+
+    return 0
+}
+
+# Method 2: build the module from the official repository
+try_kernel_source() {
+    log "方式 2：从官方仓库源码编译内核模块"
+
+    init_workdir
+
+    local src="${WORK_DIR}/amneziawg-kmod"
+    local build_log="${WORK_DIR}/kmod-build.log"
+    local clone_args=(--depth 1)
+
+    if [[ -n "${AWG_KMOD_REF}" ]]; then
+        clone_args+=(--branch "${AWG_KMOD_REF}")
+    fi
+
+    git clone "${clone_args[@]}" "${AWG_KMOD_REPO}" "${src}" || {
+        warn "克隆 amneziawg-linux-kernel-module 失败"
+        summary_add "内核模块 方式 2（源码编译）" "失败（克隆仓库失败）"
+        return 1
+    }
+
+    local build_dir="${src}/src"
+
+    if [[ ! -f "${build_dir}/Makefile" ]]; then
+        warn "找不到 ${build_dir}/Makefile，仓库结构可能已变化"
+        summary_add "内核模块 方式 2（源码编译）" "失败（仓库结构与预期不符）"
+        return 1
+    fi
+
+    log "编译内核模块（针对 $(uname -r)）"
+
+    local build_ok=0
+
+    if make -C "${build_dir}" -j"$(nproc)" >"${build_log}" 2>&1; then
+        build_ok=1
+    elif grep -q 'setup_udp_tunnel_sock' "${build_log}" && \
+        patch_kmod_compat "${build_dir}"; then
+
+        warn "检测到 setup_udp_tunnel_sock 接口变化（Linux 7.0），已打兼容补丁，重新编译（未经上游验证）"
+        summary_add "内核模块源码补丁" "已对 compat.h 应用 Linux 7.0 兼容补丁（未经上游验证）"
+
+        make -C "${build_dir}" clean >/dev/null 2>&1 || true
+
+        if make -C "${build_dir}" -j"$(nproc)" >"${build_log}" 2>&1; then
+            build_ok=1
+        fi
+    fi
+
+    if [[ "${build_ok}" -ne 1 ]]; then
+        summary_add "内核模块 方式 2（源码编译）" "失败（编译错误，内核 $(uname -r) 可能不受支持）"
+        warn "源码编译失败（内核 $(uname -r) 可能仍不受支持），日志末尾 30 行："
+        echo "------------------------------"
+        tail -n 30 "${build_log}" || true
+        echo "------------------------------"
+        return 1
+    fi
+
+    local ko
+    ko="$(find "${build_dir}" -maxdepth 2 -name 'amneziawg.ko' -print -quit 2>/dev/null || true)"
+
+    if [[ -z "${ko}" ]]; then
+        warn "编译完成但没有找到 amneziawg.ko"
+        summary_add "内核模块 方式 2（源码编译）" "失败（没有找到 amneziawg.ko）"
+        return 1
+    fi
+
+    local dest="/lib/modules/$(uname -r)/updates/amneziawg.ko"
+
+    install -D -m 644 "${ko}" "${dest}" || return 1
+    depmod -a || true
+
+    if ! modprobe amneziawg || [[ ! -d /sys/module/amneziawg ]]; then
+        warn "源码编译的模块无法加载"
+        summary_add "内核模块 方式 2（源码编译）" "失败（模块无法加载）"
+        rm -f "${dest}"
+        depmod -a || true
+        return 1
+    fi
+
+    echo
+    echo "Module:"
+    modinfo amneziawg || true
+
+    summary_add "内核模块 方式 2（源码编译）" "成功（未注册 DKMS，Linux 内核升级后需重新编译）"
+
+    warn "此方式没有注册 DKMS：Linux 内核升级后，需要重新编译该模块"
+
+    return 0
 }
 
 ###############################################################################
-# AmneziaWG userspace tools
+# Backend 3: userspace (amneziawg-go)
 ###############################################################################
 
-install_tools() {
-    log "下载 amneziawg-tools ${TOOLS_VERSION}"
+# ensure_go <min-version>
+# Uses the system Go if new enough, otherwise downloads the official Go
+# toolchain into the temporary work dir (nothing is installed system-wide).
+ensure_go() {
+    local required="$1"
+    local have=""
 
-    BUILD_DIR="$(mktemp -d /tmp/amneziawg-tools.XXXXXX)"
+    if command -v go >/dev/null 2>&1; then
+        have="$(go env GOVERSION 2>/dev/null |
+            sed -E 's/^go([0-9]+(\.[0-9]+)*).*/\1/' || true)"
+    fi
 
-    git clone \
-        --depth 1 \
-        --branch "${TOOLS_VERSION}" \
-        "${TOOLS_REPO}" \
-        "${BUILD_DIR}"
+    if [[ -n "${have}" ]] && version_ge "${have}" "${required}"; then
+        echo "使用系统 Go：${have}"
+        summary_add "Go 工具链" "使用系统已有 Go ${have}（未额外安装）"
+        return 0
+    fi
 
-    [[ -d "${BUILD_DIR}/src" ]] || \
-        die "找不到源码目录：${BUILD_DIR}/src"
+    log "系统 Go 版本不足（当前：${have:-未安装}，需要：>= ${required}），下载官方 Go"
 
-    [[ -f "${BUILD_DIR}/src/Makefile" ]] || {
-        echo
-        echo "源码目录内容："
-        find "${BUILD_DIR}" -maxdepth 2 -type f | sort || true
-        die "找不到 ${BUILD_DIR}/src/Makefile"
+    local arch go_ver
+
+    case "$(uname -m)" in
+        x86_64)        arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *)
+            warn "不支持的架构：$(uname -m)"
+            return 1
+            ;;
+    esac
+
+    go_ver="$(
+        curl -fsSL --max-time 15 'https://go.dev/VERSION?m=text' 2>/dev/null |
+            sed -n '1p' || true
+    )"
+
+    if [[ ! "${go_ver}" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        go_ver="${GO_FALLBACK_VERSION}"
+    fi
+
+    echo "下载 ${go_ver} (${arch})"
+
+    curl -fL --retry 3 --connect-timeout 15 \
+        -o "${WORK_DIR}/go.tar.gz" \
+        "https://go.dev/dl/${go_ver}.linux-${arch}.tar.gz" || {
+        warn "下载 Go 失败"
+        return 1
+    }
+
+    mkdir -p "${WORK_DIR}/goroot" || return 1
+
+    tar -C "${WORK_DIR}/goroot" -xzf "${WORK_DIR}/go.tar.gz" || {
+        warn "解压 Go 失败"
+        return 1
+    }
+
+    export GOROOT="${WORK_DIR}/goroot/go"
+    export PATH="${GOROOT}/bin:${PATH}"
+
+    command -v go >/dev/null 2>&1 || return 1
+
+    echo "使用下载的 Go：$(go version)"
+    summary_add "Go 工具链 安装方式" "官方压缩包下载（${go_ver}，仅临时用于编译，安装结束后删除）"
+    return 0
+}
+
+# Compiling Go (especially with a freshly downloaded toolchain) can need
+# well over 1 GB of RAM. On small instances the OOM killer ends the compiler
+# ("compile: signal: killed"), so add a temporary swap file when memory is low.
+ensure_build_memory() {
+    local mem_kb swap_kb avail_kb swap_file="/var/tmp/awg-build.swap"
+
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
+
+    echo "内存：$((mem_kb / 1024)) MB，swap：$((swap_kb / 1024)) MB"
+
+    if (( mem_kb + swap_kb >= 2500 * 1024 )); then
+        summary_add "临时 swap" "不需要（内存 $((mem_kb / 1024)) MB + swap $((swap_kb / 1024)) MB 足够）"
+        return 0
+    fi
+
+    avail_kb="$(df -Pk /var/tmp | awk 'NR==2 {print $4}')"
+
+    if (( avail_kb < 3 * 1024 * 1024 )); then
+        warn "磁盘剩余空间不足 3GB，无法创建临时 swap，编译可能因内存不足失败"
+        return 0
+    fi
+
+    log "内存 + swap 不足 2.5GB，临时创建 2GB swap 用于编译（安装结束后自动删除）"
+
+    rm -f "${swap_file}"
+
+    if { fallocate -l 2G "${swap_file}" 2>/dev/null || \
+         dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none; } && \
+       chmod 600 "${swap_file}" && \
+       mkswap "${swap_file}" >/dev/null && \
+       swapon "${swap_file}"; then
+        TEMP_SWAP="${swap_file}"
+        echo "已启用临时 swap：${swap_file}"
+        summary_add "临时 swap" "已创建 2GB（仅编译 amneziawg-go 用，安装结束后删除）"
+    else
+        warn "创建临时 swap 失败，继续尝试编译"
+        summary_add "临时 swap" "创建失败（编译可能因内存不足失败）"
+        rm -f "${swap_file}"
+    fi
+
+    return 0
+}
+
+try_userspace_backend() {
+    log "尝试方式 B：用户态实现 (amneziawg-go)"
+
+    init_workdir
+
+    if [[ ! -c /dev/net/tun ]]; then
+        modprobe tun 2>/dev/null || true
+    fi
+
+    if [[ ! -c /dev/net/tun ]]; then
+        warn "/dev/net/tun 不存在，用户态实现无法工作"
+        summary_add "amneziawg-go" "失败（缺少 /dev/net/tun）"
+        return 1
+    fi
+
+    local src="${WORK_DIR}/amneziawg-go"
+    local clone_args=(--depth 1)
+
+    if [[ -n "${AWG_GO_REF}" ]]; then
+        clone_args+=(--branch "${AWG_GO_REF}")
+    fi
+
+    git clone "${clone_args[@]}" "${AWG_GO_REPO}" "${src}" || {
+        warn "克隆 amneziawg-go 失败"
+        return 1
+    }
+
+    local need
+    need="$(awk '/^go[[:space:]]+[0-9]/ {print $2; exit}' "${src}/go.mod" 2>/dev/null || true)"
+    need="${need:-1.20}"
+
+    ensure_go "${need}" || return 1
+
+    export GOTOOLCHAIN="auto"
+    export GOCACHE="${WORK_DIR}/gocache"
+    export GOPATH="${WORK_DIR}/gopath"
+
+    ensure_build_memory
+
+    log "编译 amneziawg-go（低内存模式）"
+
+    (
+        cd "${src}" &&
+        GOGC=50 CGO_ENABLED=0 \
+            go build -p 1 -gcflags=all=-c=1 -trimpath -o amneziawg-go .
+    ) || {
+        warn "编译 amneziawg-go 失败"
+        summary_add "amneziawg-go" "失败（编译错误，可能是内存不足被系统杀掉）"
+        return 1
+    }
+
+    install -m 755 "${src}/amneziawg-go" "${AWG_GO_BIN}" || return 1
+
+    local go_rev
+    go_rev="$(git -C "${src}" rev-parse --short HEAD 2>/dev/null || true)"
+
+    summary_add "amneziawg-go 安装方式" "源码编译${go_rev:+（commit ${go_rev}）} -> ${AWG_GO_BIN}"
+
+    echo
+    echo "amneziawg-go：${AWG_GO_BIN}"
+    "${AWG_GO_BIN}" --version || true
+
+    return 0
+}
+
+###############################################################################
+# Backend selection
+###############################################################################
+
+select_backend() {
+    case "${AWG_BACKEND}" in
+        auto|kernel|userspace) ;;
+        *) die "AWG_BACKEND 只能是 auto / kernel / userspace，当前：${AWG_BACKEND}" ;;
+    esac
+
+    log "后端选择模式：${AWG_BACKEND}（顺序：PPA 内核模块 -> 源码内核模块 -> amneziawg-go）"
+
+    init_workdir
+
+    summary_add "后端选择模式" "${AWG_BACKEND}"
+
+    if [[ "${AWG_BACKEND}" == "userspace" ]]; then
+        summary_add "内核模块 方式 1 / 2" "已跳过（AWG_BACKEND=userspace）"
+    fi
+
+    if [[ "${AWG_BACKEND}" != "userspace" ]]; then
+        if ensure_kernel_headers; then
+            if try_kernel_ppa; then
+                BACKEND="kernel"
+                BACKEND_DESC="内核模块（方式 1：PPA / amneziawg-dkms）"
+            elif try_kernel_source; then
+                BACKEND="kernel"
+                BACKEND_DESC="内核模块（方式 2：官方仓库源码编译）"
+            fi
+        else
+            warn "没有可用的内核 headers，跳过内核模块方式"
+            summary_add "内核模块 方式 1 / 2" "未尝试（缺少内核 headers）"
+        fi
+
+        if [[ -z "${BACKEND}" ]]; then
+            if [[ "${AWG_BACKEND}" == "kernel" ]]; then
+                die "已指定 AWG_BACKEND=kernel，但两种内核模块方式都失败"
+            fi
+
+            warn "内核模块方式都不可用，自动切换到 amneziawg-go"
+        fi
+    fi
+
+    if [[ -z "${BACKEND}" ]]; then
+        if try_userspace_backend; then
+            BACKEND="userspace"
+            BACKEND_DESC="用户态（方式 3：amneziawg-go）"
+        else
+            die "三种方式都失败，请查看上方日志"
+        fi
+    fi
+
+    summary_add "AmneziaWG 实现方式" "${BACKEND_DESC}"
+
+    echo
+    echo "############################################################"
+    echo "#"
+    echo "#  AmneziaWG 实现方式：${BACKEND_DESC}"
+    echo "#  Linux 内核版本：$(uname -r)"
+    echo "#"
+    echo "############################################################"
+}
+
+###############################################################################
+# AmneziaWG userspace tools (awg / awg-quick)
+###############################################################################
+
+build_tools_from_source() {
+    init_workdir
+
+    local src="${WORK_DIR}/tools"
+
+    log "方式 2：源码编译 amneziawg-tools（${TOOLS_VERSION}）"
+
+    if git clone --depth 1 --branch "${TOOLS_VERSION}" \
+        "${TOOLS_REPO}" "${src}" 2>/dev/null; then
+
+        TOOLS_REF_USED="${TOOLS_VERSION}"
+    else
+        warn "无法克隆标签 ${TOOLS_VERSION}，改用默认分支"
+        rm -rf "${src}"
+
+        git clone --depth 1 "${TOOLS_REPO}" "${src}" || return 1
+
+        TOOLS_REF_USED="默认分支"
+    fi
+
+    [[ -f "${src}/src/Makefile" ]] || {
+        warn "找不到 ${src}/src/Makefile"
+        return 1
     }
 
     log "编译 amneziawg-tools"
-
-    make -C "${BUILD_DIR}/src"
+    make -C "${src}/src" || return 1
 
     log "安装 amneziawg-tools"
+    make -C "${src}/src" WITH_SYSTEMDUNITS=yes install || return 1
 
-    make -C "${BUILD_DIR}/src" install
+    return 0
+}
+
+install_tools_from_ppa() {
+    log "方式 1：PPA 安装 amneziawg-tools"
+
+    add-apt-repository -y ppa:amnezia/ppa || return 1
+
+    if ! apt-get update; then
+        warn "apt-get update 失败（PPA 可能不支持当前 Ubuntu 版本），移除该 PPA"
+        add-apt-repository -y -r ppa:amnezia/ppa >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    DEBIAN_FRONTEND=noninteractive apt-get install -y amneziawg-tools || return 1
+
+    return 0
+}
+
+install_tools() {
+    local tools_method=""
+
+    log "安装 amneziawg-tools（优先 PPA，失败则源码编译）"
+
+    if install_tools_from_ppa; then
+        tools_method="PPA（apt）"
+    else
+        warn "PPA 方式安装 amneziawg-tools 失败，改为源码编译"
+        summary_add "amneziawg-tools 方式 1（PPA）" "失败"
+
+        if build_tools_from_source; then
+            tools_method="源码编译（${TOOLS_REF_USED}）"
+        else
+            summary_add "amneziawg-tools 方式 2（源码编译）" "失败"
+            die "amneziawg-tools 安装失败（PPA 和源码编译都失败）"
+        fi
+    fi
+
+    local tools_ver
+    tools_ver="$(awg --version 2>/dev/null | sed -n '1p' || true)"
+
+    summary_add "amneziawg-tools 安装方式" "${tools_method}${tools_ver:+，${tools_ver}}"
 
     command -v awg >/dev/null 2>&1 || \
         die "安装完成后找不到 awg"
@@ -225,13 +787,86 @@ install_tools() {
         die "安装完成后找不到 awg-quick"
 
     echo
+    echo "amneziawg-tools 安装方式：${tools_method}"
+
+    echo
     echo "awg:"
     command -v awg
-    awg --version
+    awg --version || true
 
     echo
     echo "awg-quick:"
     command -v awg-quick
+}
+
+###############################################################################
+# systemd unit + backend specific service configuration
+###############################################################################
+
+ensure_systemd_unit() {
+    if systemctl cat "awg-quick@${WG_INTERFACE}.service" >/dev/null 2>&1; then
+        summary_add "awg-quick systemd 服务" "由 amneziawg-tools 自带"
+        return 0
+    fi
+
+    warn "未找到 awg-quick@.service，手动创建"
+
+    local awg_bin awg_quick_bin
+
+    awg_bin="$(command -v awg)"
+    awg_quick_bin="$(command -v awg-quick)"
+
+    cat > /etc/systemd/system/awg-quick@.service <<EOF
+[Unit]
+Description=AmneziaWG via awg-quick(8) for %I
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+Documentation=man:awg-quick(8)
+Documentation=man:awg(8)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${awg_quick_bin} up %i
+ExecStop=${awg_quick_bin} down %i
+ExecReload=/bin/bash -c 'exec ${awg_bin} syncconf %i <(exec ${awg_quick_bin} strip %i)'
+Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+
+    systemctl cat "awg-quick@${WG_INTERFACE}.service" >/dev/null 2>&1 || \
+        die "无法创建 awg-quick systemd 服务"
+
+    summary_add "awg-quick systemd 服务" "工具包未自带，已手动创建 /etc/systemd/system/awg-quick@.service"
+}
+
+configure_backend_service() {
+    local dropin_dir="/etc/systemd/system/awg-quick@.service.d"
+    local dropin="${dropin_dir}/10-amneziawg-backend.conf"
+
+    if [[ "${BACKEND}" == "userspace" ]]; then
+        log "配置 awg-quick 使用 amneziawg-go"
+
+        mkdir -p "${dropin_dir}"
+
+        cat > "${dropin}" <<EOF
+[Service]
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=${AWG_GO_BIN}
+EOF
+
+        summary_add "服务后端配置" "systemd drop-in 指向 ${AWG_GO_BIN}"
+    else
+        rm -f "${dropin}"
+        rmdir "${dropin_dir}" 2>/dev/null || true
+
+        summary_add "服务后端配置" "使用内核模块（无需额外配置）"
+    fi
+
+    systemctl daemon-reload
 }
 
 ###############################################################################
@@ -746,8 +1381,16 @@ verify_installation() {
     command -v awg-quick >/dev/null 2>&1 || \
         die "找不到 awg-quick"
 
-    lsmod | grep -q '^amneziawg' || \
-        die "amneziawg 内核模块没有加载"
+    echo
+    echo "实现方式：${BACKEND_DESC}"
+
+    if [[ "${BACKEND}" == "kernel" ]]; then
+        [[ -d /sys/module/amneziawg ]] || \
+            die "amneziawg 内核模块没有加载"
+    else
+        pgrep -x amneziawg-go >/dev/null 2>&1 || \
+            die "amneziawg-go 进程没有运行"
+    fi
 
     ip link show "${WG_INTERFACE}" >/dev/null 2>&1 || \
         die "${WG_INTERFACE} 不存在"
@@ -789,9 +1432,13 @@ install_main() {
 
     install_dependencies
 
-    install_dkms
+    select_backend
 
     install_tools
+
+    ensure_systemd_unit
+
+    configure_backend_service
 
     detect_network
 
@@ -822,6 +1469,9 @@ install_main() {
     echo " AmneziaWG 安装成功"
     echo "============================================================"
     echo
+    echo "实现方式："
+    echo "${BACKEND_DESC}"
+    echo
     echo "服务器："
     echo "${PUBLIC_IP}:${WG_PORT}/UDP"
     echo
@@ -851,9 +1501,11 @@ install_main() {
     echo
     echo "[IMPORTANT] 请确认 AWS Security Group 已放行：UDP ${WG_PORT}"
     echo
-	
-	add_client client2
-	echo "已添加客户端2"
+
+    add_client client2
+    echo "已添加客户端2"
+
+    print_install_summary
 }
 
 ###############################################################################
